@@ -1,0 +1,97 @@
+name: build
+
+# golang.org/x/net ships no GitHub Actions CI upstream (it is tested by the Go
+# project's own TryBot/LUCI builders, which live outside the repo). This workflow
+# is authored for the sealed build: it produces the published module source zip
+# and runs the project's real test suite -- `go build ./...` / `go test ./...`,
+# the commands CONTRIBUTING.md and the go.mod toolchain directive imply.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level test names to run. Empty runs the full suite."
+        required: false
+        default: ""
+
+env:
+  MODULE_PATH: golang.org/x/net
+  MODULE_VERSION: v0.45.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # go.mod declares `go 1.24.0`; pin the 1.24 line the release was cut on.
+          go-version: "1.24"
+          cache: false
+
+      - name: Report toolchain
+        run: go version
+
+      - name: Build the module-zip helper
+        # .github/modzip is its own module, resolved outside the source tree so
+        # that pulling golang.org/x/mod never edits golang.org/x/net's go.mod.
+        run: |
+          set -eo pipefail
+          rm -rf /tmp/modzip
+          cp -a "${GITHUB_WORKSPACE}/.github/modzip" /tmp/modzip
+          cd /tmp/modzip
+          go mod tidy
+          go build -o /tmp/create_mod ./create_mod.go
+
+      - name: Stage the module tree
+        # The published zip is packed from the module tree, so this workflow and
+        # its helper must not travel inside it: upstream ships no .github/ at all,
+        # and an extra member fails artifact verification. Pack a copy with
+        # .github/ removed; the checked-out tree keeps both so the version patch
+        # still carries them.
+        run: |
+          set -eo pipefail
+          rm -rf /tmp/modsrc
+          mkdir -p /tmp/modsrc
+          cp -a "${GITHUB_WORKSPACE}/." /tmp/modsrc/
+          rm -rf /tmp/modsrc/.git /tmp/modsrc/.github
+          ls -A /tmp/modsrc
+
+      - name: Produce the module zip
+        # Packed before build/test so no byproduct can leak into the artifact.
+        run: |
+          set -eo pipefail
+          mkdir -p "${GITHUB_WORKSPACE}/build_output"
+          /tmp/create_mod "${MODULE_PATH}" "${MODULE_VERSION}" /tmp/modsrc "${GITHUB_WORKSPACE}/build_output/${MODULE_VERSION}.zip"
+          unzip -l "${GITHUB_WORKSPACE}/build_output/${MODULE_VERSION}.zip" | tail -5
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        # Full suite by default; only the named tests when a selector is given.
+        # The per-name grep is a fail-closed guard: `go test -run` exits 0 when a
+        # pattern matches nothing, so every selected test must log its own
+        # `=== RUN` line rather than one match vouching for the rest.
+        run: |
+          set -eo pipefail
+          FILTER="${{ inputs.test-filter }}"
+          if [ -n "${FILTER}" ]; then
+            go test -v -run "^($(echo "${FILTER}" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in ${FILTER}; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|\$)" /tmp/scoped.log || { echo "selected test ${t} never ran"; exit 1; }
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: build_output/v0.45.0.zip
+          if-no-files-found: error
