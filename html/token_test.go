@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -933,3 +943,85 @@ func benchmarkTokenizer(b *testing.B, level int) {
 func BenchmarkRawLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, rawLevel) }
 func BenchmarkLowLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, lowLevel) }
 func BenchmarkHighLevelTokenizer(b *testing.B) { benchmarkTokenizer(b, highLevel) }
+
+func TestDuplicateAttributeSanitizerBypass(t *testing.T) {
+	// A browser keeps the first occurrence of a repeated attribute and discards
+	// the rest. Reporting the later ones let a caller (typically a sanitizer)
+	// disagree with the browser about an element's attributes, which is a
+	// cross-site scripting vector.
+	const input = `<a href="https://example.com/" HREF="javascript:alert(1)" onclick=safe() onCLICK="alert(2)">x</a>`
+
+	z := NewTokenizer(strings.NewReader(input))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("Next: got %s, want StartTagToken", tt)
+	}
+	want := []Attribute{
+		{Key: "href", Val: "https://example.com/"},
+		{Key: "onclick", Val: "safe()"},
+	}
+	got := z.Token().Attr
+	if len(got) != len(want) {
+		t.Fatalf("Token().Attr = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].Key != want[i].Key || got[i].Val != want[i].Val {
+			t.Errorf("Token().Attr[%d] = %q=%q, want %q=%q", i, got[i].Key, got[i].Val, want[i].Key, want[i].Val)
+		}
+	}
+
+	// The low-level TagAttr API must agree with Token.
+	z = NewTokenizer(strings.NewReader(input))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("Next: got %s, want StartTagToken", tt)
+	}
+	_, more := z.TagName()
+	var n int
+	for more {
+		var key, val []byte
+		key, val, more = z.TagAttr()
+		if n >= len(want) {
+			t.Fatalf("TagAttr returned more than %d attributes; extra %q=%q", len(want), key, val)
+		}
+		if string(key) != want[n].Key || string(val) != want[n].Val {
+			t.Errorf("TagAttr #%d = %q=%q, want %q=%q", n, key, val, want[n].Key, want[n].Val)
+		}
+		n++
+	}
+	if n != len(want) {
+		t.Errorf("TagAttr returned %d attributes, want %d", n, len(want))
+	}
+
+	// A Parse/Render round trip must not resurrect the shadowed duplicates.
+	doc, err := Parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := Render(&buf, doc); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if rendered := buf.String(); strings.Contains(rendered, "javascript:") || strings.Contains(rendered, "alert(2)") {
+		t.Errorf("Render emitted a shadowed duplicate attribute: %s", rendered)
+	}
+}
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
